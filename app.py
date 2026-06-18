@@ -1,315 +1,167 @@
-"""
-Pharma HTML Report → Excel Converter
-S.F. Medical Agency — Tally/FoxPro absolute-positioned HTML parser
-Clean output: Party Name, Item Name, Qty, Free, Rate, Amount
-"""
-
-import io
-import re
-import pandas as pd
-from flask import Flask, request, jsonify, send_file, render_template
-from bs4 import BeautifulSoup
+Here is a production-ready prompt you can drop into any AI agent:
 
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB max upload
+---
 
+**SYSTEM / TASK PROMPT**
 
-# ─────────────────────────────────────────────
-#  PARSER HELPERS
-# ─────────────────────────────────────────────
+---
 
-def extract_top(style: str) -> float:
-    """Parse 'top:NNpx' from an inline style string. Returns 0 if not found."""
-    m = re.search(r"top\s*:\s*([\d.]+)", style or "")
-    return float(m.group(1)) if m else 0.0
+## Project: HTML Invoice Report → Excel Converter (Web App)
 
-
-def extract_left(style: str) -> float:
-    """Parse 'left:NNpx' from an inline style string. Returns 0 if not found."""
-    m = re.search(r"left\s*:\s*([\d.]+)", style or "")
-    return float(m.group(1)) if m else 0.0
-
-
-def get_divs_sorted(soup: BeautifulSoup):
-    """Return all divs with inline style, sorted by (top, left) for visual reading order."""
-    divs = []
-    for div in soup.find_all("div", style=True):
-        text = div.get_text(separator=" ", strip=True)
-        if not text:
-            continue
-        style = div.get("style", "")
-        top = extract_top(style)
-        left = extract_left(style)
-        divs.append({"top": top, "left": left, "text": text})
-
-    divs.sort(key=lambda d: (round(d["top"], 0), d["left"]))
-    return divs
-
-
-def group_into_lines(divs, y_tolerance: float = 4.0) -> list[str]:
-    """
-    Cluster divs that share similar top values into logical lines.
-    Within each line, sort by left position and join text fragments.
-    """
-    if not divs:
-        return []
-
-    lines = []
-    current_group = [divs[0]]
-
-    for div in divs[1:]:
-        anchor_top = current_group[0]["top"]
-        if abs(div["top"] - anchor_top) <= y_tolerance:
-            current_group.append(div)
-        else:
-            current_group.sort(key=lambda d: d["left"])
-            line_text = "  ".join(d["text"] for d in current_group)
-            lines.append(line_text)
-            current_group = [div]
-
-    if current_group:
-        current_group.sort(key=lambda d: d["left"])
-        line_text = "  ".join(d["text"] for d in current_group)
-        lines.append(line_text)
-
-    return lines
-
-
-NUM_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
-
-
-def is_numeric(token: str) -> bool:
-    return bool(NUM_RE.match(token))
-
-
-def is_party_line(line: str) -> bool:
-    """
-    Party names are ALL-CAPS lines with NO standalone numbers.
-    """
-    stripped = line.strip()
-    if len(stripped) < 3:
-        return False
-    if re.match(r"^[-=*_]+$", stripped):
-        return False
-
-    tokens = stripped.split()
-    for tok in tokens:
-        if re.match(r"^\d+(?:\.\d+)?$", tok):
-            return False
-
-    alpha_chars = [c for c in stripped if c.isalpha()]
-    if not alpha_chars:
-        return False
-
-    upper_ratio = sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars)
-    if upper_ratio < 0.88:
-        return False
-
-    return True
-
-
-def is_separator(line: str) -> bool:
-    return bool(re.match(r"^[\s\-=*_|]+$", line))
-
-
-def parse_item_line(line: str) -> dict | None:
-    """
-    Extract item_name, qty, free, rate, amount from an item row.
-
-    Rule:
-      - Last 4 numeric/dash tokens = Qty, Free, Rate, Amount
-      - '-' in Free slot = 0
-      - Everything before those 4 tokens = Item Name
-    """
-    tokens = line.split()
-    if not tokens:
-        return None
-
-    numeric_indices = []
-    for i, tok in enumerate(tokens):
-        if is_numeric(tok) or tok == "-":
-            numeric_indices.append(i)
-
-    if len(numeric_indices) < 4:
-        return None
-
-    qty_idx, free_idx, rate_idx, amt_idx = numeric_indices[-4:]
-
-    try:
-        qty = float(tokens[qty_idx])
-        free_tok = tokens[free_idx]
-        free = 0.0 if free_tok == "-" else float(free_tok)
-        rate = float(tokens[rate_idx])
-        amount = float(tokens[amt_idx])
-    except ValueError:
-        return None
-
-    name_tokens = tokens[:qty_idx]
-    item_name = " ".join(name_tokens).strip()
-
-    if not item_name:
-        return None
-
-    # Convert whole numbers to int for cleaner Excel output
-    qty = int(qty) if qty.is_integer() else qty
-    free = int(free) if float(free).is_integer() else free
-
-    return {
-        "item_name": item_name,
-        "qty": qty,
-        "free": free,
-        "rate": rate,
-        "amount": amount,
-    }
-
-
-def parse_html(html_content: str) -> list[dict]:
-    """
-    Main parser: reads the HTML, groups text by vertical position,
-    and extracts party → item rows.
-    """
-    soup = BeautifulSoup(html_content, "html.parser")
-    divs = get_divs_sorted(soup)
-    lines = group_into_lines(divs, y_tolerance=5.0)
-
-    rows = []
-    current_party = None
-
-    for raw_line in lines:
-        line = raw_line.strip()
-
-        if not line:
-            continue
-        if is_separator(line):
-            continue
-
-        # TOTAL lines are not data rows
-        if re.search(r"\bTOTAL\b", line, re.IGNORECASE):
-            continue
-
-        # Detect party header
-        if is_party_line(line):
-            current_party = line.strip()
-            continue
-
-        # Parse item row
-        if current_party:
-            parsed = parse_item_line(line)
-            if parsed:
-                rows.append({
-                    "Party Name": current_party,
-                    "Item Name": parsed["item_name"],
-                    "Qty": parsed["qty"],
-                    "Free": parsed["free"],
-                    "Rate": parsed["rate"],
-                    "Amount": parsed["amount"],
-                })
-
-    return rows
-
-
-# ─────────────────────────────────────────────
-#  EXCEL BUILDER
-# ─────────────────────────────────────────────
-
-def build_excel(rows: list[dict]) -> bytes:
-    """
-    Build a clean .xlsx with exactly:
-    Party Name | Item Name | Qty | Free | Rate | Amount
-    No extra columns, no merged rows, no party separator rows.
-    """
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        df = pd.DataFrame(columns=["Party Name", "Item Name", "Qty", "Free", "Rate", "Amount"])
-    else:
-        df = df[["Party Name", "Item Name", "Qty", "Free", "Rate", "Amount"]]
-
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Sales Report")
-
-    output.seek(0)
-    return output.read()
-
-
-# ─────────────────────────────────────────────
-#  ROUTES
-# ─────────────────────────────────────────────
-
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-@app.route("/parse", methods=["POST"])
-def parse_files():
-    """Accept one or more HTML files, return JSON with parsed rows + stats."""
-    files = request.files.getlist("files")
-    if not files:
-        return jsonify({"error": "No files uploaded"}), 400
-
-    all_rows = []
-    file_stats = []
-
-    for f in files:
-        if not f.filename:
-            continue
-        try:
-            html_content = f.read().decode("utf-8", errors="replace")
-            rows = parse_html(html_content)
-            all_rows.extend(rows)
-            file_stats.append({
-                "name": f.filename,
-                "rows": len(rows),
-                "parties": len(set(r["Party Name"] for r in rows)),
-                "status": "ok"
-            })
-        except Exception as e:
-            file_stats.append({
-                "name": f.filename,
-                "rows": 0,
-                "parties": 0,
-                "status": f"error: {str(e)}"
-            })
-
-    if not all_rows:
-        return jsonify({
-            "error": "No data could be extracted. Please check the file format.",
-            "file_stats": file_stats
-        }), 422
-
-    return jsonify({
-        "total_rows": len(all_rows),
-        "total_parties": len(set(r["Party Name"] for r in all_rows)),
-        "file_stats": file_stats,
-        "preview": all_rows[:200],
-        "data": all_rows
-    })
-
-
-@app.route("/download", methods=["POST"])
-def download():
-    """Accept JSON rows in request body, return .xlsx file."""
-    payload = request.get_json(force=True)
-    rows = payload.get("data", [])
-    filename = payload.get("filename", "pharma_report")
-
-    if not rows:
-        return jsonify({"error": "No data to export"}), 400
-
-    xlsx_bytes = build_excel(rows)
-    buf = io.BytesIO(xlsx_bytes)
-    buf.seek(0)
-
-    safe_name = re.sub(r"[^\w\-.]", "_", filename)
-    return send_file(
-        buf,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        as_attachment=True,
-        download_name=f"{safe_name}.xlsx"
-    )
-
-
-if __name__ == "__main__":
-    app.run(debug=True, port=5050)
+### Overview
+
+Build a **single-page web application** (pure HTML + CSS + JavaScript, no backend, no frameworks required) that allows a user to upload an HTML invoice report file and automatically converts it into a clean, well-formatted **Excel (.xlsx) file** for download.
+
+The HTML report files this tool will process are always generated by a legacy VFP/MSHTML print engine and have a **fixed, known structure** described in detail below. The app must parse that structure precisely and export structured data.
+
+---
+
+### Input File Structure (Critical — Read Carefully)
+
+The HTML file has these exact characteristics:
+
+1. **All content is rendered using absolutely positioned `<div>` tags** — there are NO `<table>` elements for data. Every row of data is a `<div>` with an inline `style` containing `top: Npx` (vertical position) and `left: 5px`.
+
+2. **CSS class:** All data divs have `class="font1"`. Non-printable border divs have `class="basenotprint"` — **ignore those entirely**.
+
+3. **Pages:** The report can span multiple pages. Each page is wrapped in `<div class="page" style="width:793px; height:1122px; ...">`. Each page is **1122px tall**. To get the true vertical order of a line, calculate its **absolute top position** as:
+   ```
+   absolute_top = (page_index × 1122) + div's_top_value
+   ```
+   Page index starts at 0.
+
+4. **Character encoding:** The file uses `windows-1252` encoding. The non-breaking hyphen character `&#8209;` (Unicode `\u2011`) is used both as a **dash placeholder** (meaning zero/nil in Free Qty column) and as a **separator line filler**. Normalize all `\u2011` to regular `-`.
+
+5. **Text extraction:** Extract text from each `font1` div using `innerText` or equivalent, collapse all whitespace (including `&nbsp;`) to single spaces, and trim.
+
+---
+
+### Line Classification Rules
+
+After extracting and sorting all lines by `absolute_top`, classify each line as one of these types:
+
+| Type | How to identify |
+|---|---|
+| **SKIP** | Matches any of: starts with 5+ dashes `-----`, matches `D E S C R I P T I O N`, contains `S.F.MEDICAL AGENCY` as a standalone header, contains `PARTY / ITEM WISE SALES SUMMARY`, starts with `5/38`, starts with `Phone :`, starts with `GSTIN :`, starts with `Report For`, starts with `Company :`, contains `Continued..`, contains `Page No..` |
+| **TOTAL ROW** | Contains the word `TOTAL :` — skip these |
+| **PARTY NAME** | A non-empty line that does **not** match the item pattern (see below) and does **not** contain a 3-or-more digit number |
+| **ITEM ROW** | The last 5 space-separated tokens of the line match: `qty` (number or `-`), `free` (number or `-`), `rate` (decimal number), `amount` (decimal number), `pct` (decimal number). Everything before these 5 tokens is the Item Name. |
+
+---
+
+### Data Extraction Logic
+
+```
+current_party = null
+records = []
+
+for each line (sorted by absolute_top, ascending):
+    if line is SKIP → continue
+    if line is TOTAL ROW → continue
+    if line is ITEM ROW:
+        parse last 5 tokens as: qty, free, rate, amount, pct
+        item_name = everything before those 5 tokens
+        if free == "-": free = "0"
+        append { party: current_party, item_name, qty, free, rate, amount } to records
+    else if line is PARTY NAME:
+        current_party = line text (trimmed)
+```
+
+**Negative values are valid** (e.g., sales returns). Do not discard lines where qty or amount starts with `-`.
+
+---
+
+### Output Excel File Structure
+
+Use the **SheetJS (xlsx.js)** library (load from CDN: `https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js`) to generate the `.xlsx` file client-side.
+
+The output Excel file must have:
+
+**Sheet name:** `Sales Data`
+
+**Columns (in this order):**
+
+| Column | Header | Notes |
+|---|---|---|
+| A | Party Name | Text |
+| B | Item Name | Text |
+| C | Qty | Number (integer) |
+| D | Free | Number (integer) |
+| E | Rate | Number (2 decimal places) |
+| F | Amount | Number (2 decimal places) |
+
+**Formatting requirements:**
+- Row 1 = header row with **bold text**, light blue background (`#BDD7EE`), center-aligned, font size 12
+- Data rows alternate between white (`#FFFFFF`) and very light grey (`#F2F2F2`) for readability
+- Column widths: Party Name = 30 chars, Item Name = 35 chars, Qty = 8, Free = 8, Rate = 12, Amount = 14
+- Freeze the top header row (freeze pane at A2)
+- Numbers in columns C, D, E, F must be stored as actual numbers (not strings) so Excel can SUM them
+- File should download automatically as `SPECIALITY_Sales_Data.xlsx`
+
+---
+
+### UI / UX Requirements
+
+The web app should be a **single HTML file** with embedded CSS and JS. The UI must include:
+
+1. **Title bar:** "Invoice HTML → Excel Converter" in a clean header
+2. **Upload zone:** A drag-and-drop area AND a file input button. Accepts only `.html` and `.htm` files. Shows the selected filename once chosen.
+3. **Convert button:** Disabled until a file is selected. Labelled "Convert & Download Excel".
+4. **Progress/status area:** After clicking Convert, show:
+   - "Parsing HTML..." while reading
+   - "X records found across Y parties." after parsing
+   - "Generating Excel file..." while building xlsx
+   - "✅ Done! File downloaded." on success
+   - "❌ Error: [message]" in red if anything fails
+5. **Preview table:** After parsing, display the first 20 rows in a styled HTML table inside the page so the user can verify data before downloading. Show columns: Party Name, Item Name, Qty, Free, Rate, Amount. If more than 20 rows exist, show a note: "Showing 20 of X rows."
+6. **Reset button:** Appears after conversion, clears everything and resets to upload state.
+
+---
+
+### Error Handling
+
+- If no `font1` divs are found → show error: "No data found. Please check this is a valid SPECIALITY report file."
+- If file cannot be read → show error: "Could not read file."
+- If a parsed record has `null` party name → skip it silently (do not crash).
+- Wrap the entire parsing and export logic in try/catch and surface any errors in the status area.
+
+---
+
+### Tech Stack Constraints
+
+- **Pure vanilla JS** — no React, Vue, jQuery, or any other JS framework
+- **One single `.html` file** — all CSS and JS inline/embedded
+- **Only one external CDN dependency:** SheetJS for Excel generation
+- Must work in **Chrome, Firefox, Edge** (modern browsers)
+- No server-side code, no Node.js — everything runs in the browser using `FileReader` API
+
+---
+
+### Complete Flow Summary
+
+```
+User opens app
+  → Drags or selects an .html file
+  → Clicks "Convert & Download Excel"
+    → FileReader reads file as text (encoding: treat as UTF-8 after browser loads it,
+       since the browser will handle windows-1252 declared in the meta tag)
+    → DOMParser parses the HTML string into a document object
+    → Extract all div.font1 elements from all div.page elements
+    → For each page div, record its page_index (0-based order in document)
+    → For each font1 div: extract top value from style, compute absolute_top
+    → Extract and clean text content
+    → Sort all lines by absolute_top
+    → Classify and extract records per rules above
+    → Display preview table (first 20 rows)
+    → Build xlsx workbook with SheetJS with formatting
+    → Trigger download of .xlsx file
+    → Show success message
+```
+
+---
+
+*The HTML input format will always follow this exact structure. Do not add support for other formats. Do not make the parser configurable. Build exactly what is described above.*
+
+---
+
+This prompt is self-contained — hand it to any AI agent (GPT-4o, Gemini, another Claude instance, etc.) and they will have everything they need to produce the full working code in one shot.
